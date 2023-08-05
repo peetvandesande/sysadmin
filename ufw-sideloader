@@ -1,0 +1,142 @@
+#!/usr/bin/bash
+#
+# ufw-sideloader
+#
+# Prepends UFW rules to block CIDRs listed in text files by first updating the
+# config file before reloading IP Tables, thus saving heaps of CPU cycles
+#
+
+# Set defaults
+action=block
+backup=true
+ufw_file=/etc/ufw/user.rules
+version=0.1
+
+function process_input() {
+	kREGEX_CIDR='[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/[0-9]{1,2}'
+	mapfile -t networks < ${infile}
+	total=${#networks[@]}
+	
+	if (( ${total} > 0 )); then
+		printf "Processing %d lines from %s.\n" $total ${infile}
+		if [[ -n ${comment} ]]; then
+			output+=("")
+			output+=("### BEGIN ${comment} ###")
+		fi
+		for network in "${networks[@]}"; do
+			if [[ ${network} =~ $kREGEX_CIDR ]]; then
+				let counter++
+				output+=("")
+				output+=("### tuple ### deny any any ${network} any 0.0.0.0/0 in")
+				output+=("-A ufw-user-input -d ${network} -j DROP")
+				output+=("")
+				output+=("### tuple ### deny any any 0.0.0.0/0 any ${network} in")
+				output+=("-A ufw-user-input -s ${network} -j DROP")
+			fi
+		done
+		if [[ -n ${comment} ]]; then
+			output+=("### END ${comment} ###")
+		fi
+	fi
+}
+
+function init_check() {
+	if [ ! -r "${ufw_file}" ]; then
+		# This verifies both the file as well as having root permissions
+		echo "Error: file isn't readable: ${ufw_file}"
+		exit 2
+	fi
+}
+
+function print_help() {
+	echo "Usage: $0 [OPTION] SOURCE"
+	echo "Adds rules from SOURCE to the UFW user.rules file\n"
+	echo "Mandatory arguments to long options are mandatory for short options too."
+	echo "  -a, --action [block]    which action to take with listed networks (default:"
+	echo "                            block)."
+	echo "                            No other actions implemented yet."
+	echo "  -b, --backup            whether to take a backup before writing the new file"
+	echo "                          (default: true)."
+	echo "  -c, --comment STRING    prepends and appends the ruleset with a comment"
+	echo "  -i, --infile            SOURCE file, default option."
+	echo "  -h, --help              display this help and exit"
+	echo "  -V, --version           output version information and exit"
+}
+
+# Get the options
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-V | --version )
+		echo "$version"
+		exit
+		;;
+	-h | --help )
+		print_help
+		exit
+		;;
+	-a | --action )
+		shift; action=$1
+		;;
+	-b | --backup )
+		backup=true
+		;;
+	-c | --comment )
+		shift; comment=$1
+		;;
+	-i | --infile )
+		shift; infile=$1
+		;;
+esac; shift; done
+if [[ "$1" == '--' ]]; then shift; fi
+
+init_check
+
+# Default action is set; ensure input file is read without further arguments given
+infile=${infile:-$1}
+
+# Validate $infile
+if [[ -z "${infile}" ]]; then
+	echo "Error: No input file given"
+	exit 2
+fi
+if [ ! -f "${infile}" ]; then
+	# File doesn't exist
+	echo "Error: file doesn't exist: ${infile}"
+	exit 2
+fi
+if [ ! -r "${infile}" ]; then
+	# File isn't readable
+	echo "Error: file isn't readable: ${infile}"
+	exit 2
+fi
+
+insert_rules=false
+processed=false
+output=()
+counter=0
+
+# Read UFW rules file
+mapfile -t lines < ${ufw_file}
+for line in "${lines[@]}"; do
+	# First insert new rules if flag is set
+	if ( ${insert_rules} && ! ${processed} ); then
+		process_input
+		processed=true
+	fi
+
+	# Copy input line to output
+	output+=("${line}")
+
+	# Find entrypoint for new lines
+	if (! ${processed}); then
+		if [[ ${line} =~ '### RULES ###' ]]; then
+			insert_rules=true
+		fi
+	fi
+done
+
+# Take backup?
+[[ ${backup} ]] && mv ${ufw_file} ${ufw_file}.old
+
+# write output
+printf "%s\n" "${output[@]}" > ${ufw_file}
+echo "Blocked traffic to and from ${counter} networks in ${infile}"
